@@ -5,7 +5,7 @@ Election night local server
 Serves the dashboard and proxies vtr.valasztas.hu server-side.
 
 Usage:
-    python server.py                  # 2026 live mode (auto-detects date)
+    python server.py                  # 2026 live mode
     python server.py --year 2022      # 2022 test mode (fixed URLs)
     python server.py --port 8080      # custom port
 
@@ -15,13 +15,14 @@ Endpoints:
     /                   -> election-dashboard.html
     /api/jeloltek       -> EgyeniJeloltek.json (candidates, cached)
     /api/eredmenyek     -> results JSON (fresh each request)
-    /api/refresh        -> re-scrape date + bust candidates cache
+    /api/refresh        -> re-read date from localhost:9123 + bust candidates cache
     /api/config         -> current config info
+
+Date segment is read from http://localhost:9123/vtr-last-update.txt (line 4).
 """
 
 import http.server
 import urllib.request
-import urllib.error
 import json
 import re
 import argparse
@@ -29,18 +30,10 @@ import threading
 from pathlib import Path
 
 # -- Constants --------------------------------------------------------
-BASE_2026    = 'https://vtr.valasztas.hu/ogy2026'
-BASE_2022    = 'https://vtr.valasztas.hu/ogy2022'
-REFRESH_PAGE = BASE_2026 + '/egyeni-valasztokeruletek'
+BASE_2026 = 'https://vtr.valasztas.hu/ogy2026'
+BASE_2022 = 'https://vtr.valasztas.hu/ogy2022'
 
-HU_MONTHS = {
-    'januar': '01', 'februar': '02', 'marcius': '03', 'aprilis': '04',
-    'majus': '05', 'junius': '06', 'julius': '07', 'augusztus': '08',
-    'szeptember': '09', 'oktober': '10', 'november': '11', 'december': '12',
-    # with accents
-    'január': '01', 'február': '02', 'március': '03', 'április': '04',
-    'május': '05', 'június': '06', 'július': '07', 'október': '10',
-}
+VTR_UPDATE_FILE = Path(__file__).parent / 'vtr-last-update.txt'
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (compatible; ElectionDashboard/1.0)',
@@ -48,7 +41,7 @@ HEADERS = {
 }
 
 
-# -- State object (no globals) ----------------------------------------
+# -- State object -----------------------------------------------------
 class AppState:
     def __init__(self, year: str):
         self.year = year
@@ -64,38 +57,43 @@ def fetch_remote(url: str, accept: str = 'application/json') -> bytes:
         return resp.read()
 
 
-def detect_date_segment() -> str | None:
-    """
-    Scrape the 2026 results page and parse the last-update timestamp.
-    'Adatok frissitve: 2026. marcius 14. 21:00:00' -> '03142100'
-    """
-    print(f'[server] Detecting date from {REFRESH_PAGE}')
-    try:
-        html = fetch_remote(REFRESH_PAGE, accept='text/html').decode('utf-8', errors='replace')
-    except Exception as e:
-        print(f'[server] WARNING: could not fetch refresh page: {e}')
-        return None
+HU_MONTHS = {
+    'január': 1, 'február': 2, 'március': 3, 'április': 4,
+    'május': 5, 'június': 6, 'július': 7, 'augusztus': 8,
+    'szeptember': 9, 'október': 10, 'november': 11, 'december': 12,
+}
 
-    pattern = r'Adatok\s+friss[ií]tve\s*:\s*\d{4}\.\s*(\w+)\s+(\d{1,2})\.\s*(\d{2}):(\d{2}):\d{2}'
-    m = re.search(pattern, html, re.IGNORECASE)
-    if not m:
-        # looser fallback
-        m = re.search(r'\d{4}\.\s*(\w+)\s+(\d{1,2})\.\s*(\d{2}):(\d{2}):\d{2}', html)
-    if not m:
-        print('[server] WARNING: date pattern not found in page')
-        return None
 
-    month_hu, day, hour, minute = m.group(1), m.group(2), m.group(3), m.group(4)
-    # strip accents for lookup fallback
-    month_key = month_hu.lower()
-    month = HU_MONTHS.get(month_key)
+def parse_hu_date(text: str) -> str | None:
+    """Parse 'Adatok frissítve: 2026. március 15. 01:00:00' -> 'MMDDHHmm'."""
+    m = re.search(r'(\w+)\s+(\d{1,2})\.\s+(\d{2}):(\d{2}):\d{2}', text)
+    if not m:
+        return None
+    month_name, day, hour, minute = m.group(1), m.group(2), m.group(3), m.group(4)
+    month = HU_MONTHS.get(month_name.lower())
     if not month:
-        print(f'[server] WARNING: unknown month "{month_hu}"')
         return None
+    return f'{month:02d}{int(day):02d}{hour}{minute}'
 
-    seg = f'{month}{int(day):02d}{hour}{minute}'
-    print(f'[server] Date detected: {seg}  (from "{m.group(0).strip()}")')
-    return seg
+
+def read_date_segment() -> str | None:
+    """Read and parse the date segment from line 4 of vtr-last-update.txt."""
+    print(f'[server] Reading date segment from {VTR_UPDATE_FILE}')
+    try:
+        lines = VTR_UPDATE_FILE.read_text(encoding='utf-8', errors='replace').splitlines()
+        if len(lines) < 4:
+            print(f'[server] WARNING: vtr-last-update.txt has fewer than 4 lines')
+            return None
+        line4 = lines[3].strip()
+        seg = parse_hu_date(line4)
+        if seg:
+            print(f'[server] Date segment from vtr-last-update.txt: {seg} (from: {line4!r})')
+            return seg
+        print(f'[server] WARNING: could not parse date from line 4: {line4!r}')
+        return None
+    except Exception as e:
+        print(f'[server] WARNING: could not read vtr-last-update.txt: {e}')
+        return None
 
 
 def get_jeloltek_url(state: AppState) -> str:
@@ -134,7 +132,7 @@ def bust_candidates(state: AppState):
 def get_results(state: AppState) -> dict:
     url = get_eredmenyek_url(state)
     if not url:
-        raise ValueError('Eredmenyek URL ismeretlen -- varjon az adatok frissitesere vagy toltse fel kezzel')
+        raise ValueError('Eredmenyek URL ismeretlen -- toltse fel kezzel vagy varjon')
     print(f'[server] Fetching results: {url}')
     return json.loads(fetch_remote(url))
 
@@ -204,11 +202,9 @@ def make_handler(state: AppState):
                     self.send_json({'error': str(e)}, 502)
 
             elif path == '/api/refresh':
-                # Re-scrape date and bust candidates cache
-                if state.year == '2026':
-                    new_seg = detect_date_segment()
-                    if new_seg:
-                        state.date_segment = new_seg
+                new_seg = read_date_segment()
+                if new_seg:
+                    state.date_segment = new_seg
                 bust_candidates(state)
                 try:
                     data = get_candidates(state)
@@ -228,6 +224,24 @@ def make_handler(state: AppState):
     return Handler
 
 
+# -- Background poller ------------------------------------------------
+def start_date_poller(state: AppState, interval: int = 5):
+    """Poll vtr-last-update.txt every `interval` seconds; update state when it changes."""
+    import time
+
+    def poll():
+        while True:
+            time.sleep(interval)
+            seg = read_date_segment()
+            if seg and seg != state.date_segment:
+                print(f'[poller] Date segment changed: {state.date_segment} -> {seg}')
+                state.date_segment = seg
+                bust_candidates(state)
+
+    t = threading.Thread(target=poll, daemon=True)
+    t.start()
+
+
 # -- Main -------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(description='Election night dashboard server')
@@ -237,13 +251,13 @@ def main():
 
     state = AppState(args.year)
 
-    if state.year == '2026':
-        state.date_segment = detect_date_segment()
-        if not state.date_segment:
-            print('[server] WARNING: date detection failed -- using fallback 03142100')
-            state.date_segment = '03142100'
-    else:
-        state.date_segment = '04161400'
+    state.date_segment = read_date_segment()
+    if not state.date_segment:
+        fallback = '03142100' if state.year == '2026' else '04161400'
+        print(f'[server] WARNING: date detection failed -- using fallback {fallback}')
+        state.date_segment = fallback
+
+    start_date_poller(state)
 
     print()
     print('  Election Dashboard Server')
