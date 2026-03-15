@@ -66,36 +66,16 @@ def fetch_remote(url: str, accept: str = 'application/json') -> bytes:
 
 def detect_date_segment() -> str | None:
     """
-    Scrape the 2026 results page and parse the last-update timestamp.
-    'Adatok frissitve: 2026. marcius 14. 21:00:00' -> '03142100'
+    Load the json from https://vtr.valasztas.hu/ogy2026/data/config.json
+    And extract the field "ver" from it, which is a date segment like "03142100" (Mar 14 21:00)
     """
-    print(f'[server] Detecting date from {REFRESH_PAGE}')
     try:
-        html = fetch_remote(REFRESH_PAGE, accept='text/html').decode('utf-8', errors='replace')
+        data = fetch_remote(BASE_2026 + '/data/config.json')
+        config = json.loads(data)
+        return config.get('ver', '')
     except Exception as e:
-        print(f'[server] WARNING: could not fetch refresh page: {e}')
-        return None
-
-    pattern = r'Adatok\s+friss[ií]tve\s*:\s*\d{4}\.\s*(\w+)\s+(\d{1,2})\.\s*(\d{2}):(\d{2}):\d{2}'
-    m = re.search(pattern, html, re.IGNORECASE)
-    if not m:
-        # looser fallback
-        m = re.search(r'\d{4}\.\s*(\w+)\s+(\d{1,2})\.\s*(\d{2}):(\d{2}):\d{2}', html)
-    if not m:
-        print('[server] WARNING: date pattern not found in page')
-        return None
-
-    month_hu, day, hour, minute = m.group(1), m.group(2), m.group(3), m.group(4)
-    # strip accents for lookup fallback
-    month_key = month_hu.lower()
-    month = HU_MONTHS.get(month_key)
-    if not month:
-        print(f'[server] WARNING: unknown month "{month_hu}"')
-        return None
-
-    seg = f'{month}{int(day):02d}{hour}{minute}'
-    print(f'[server] Date detected: {seg}  (from "{m.group(0).strip()}")')
-    return seg
+        print(f'[server] ERROR detecting date segment: {e}')
+    return None
 
 
 def get_jeloltek_url(state: AppState) -> str:
@@ -238,10 +218,11 @@ def main():
     state = AppState(args.year)
 
     if state.year == '2026':
-        state.date_segment = detect_date_segment()
-        if not state.date_segment:
-            print('[server] WARNING: date detection failed -- using fallback 03142100')
-            state.date_segment = '03142100'
+        # state.date_segment = detect_date_segment()
+        # if not state.date_segment:
+        #     print('[server] WARNING: date detection failed -- using fallback 03142100')
+        #     state.date_segment = '03142100'
+        pass
     else:
         state.date_segment = '04161400'
 
