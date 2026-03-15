@@ -21,6 +21,7 @@ Endpoints:
 
 import http.server
 import urllib.request
+import urllib.error
 import json
 import re
 import argparse
@@ -28,12 +29,17 @@ import threading
 from pathlib import Path
 
 # -- Constants --------------------------------------------------------
-BASE_2026 = 'https://vtr.valasztas.hu/ogy2026'
-BASE_2022 = 'https://vtr.valasztas.hu/ogy2022'
+BASE_2026    = 'https://vtr.valasztas.hu/ogy2026'
+BASE_2022    = 'https://vtr.valasztas.hu/ogy2022'
+REFRESH_PAGE = BASE_2026 + '/egyeni-valasztokeruletek'
 
-REFRESH_PAGES = {
-    '2026': BASE_2026 + '/egyeni-valasztokeruletek',
-    '2022': BASE_2022 + '/egyeni-valasztokeruletek',
+HU_MONTHS = {
+    'januar': '01', 'februar': '02', 'marcius': '03', 'aprilis': '04',
+    'majus': '05', 'junius': '06', 'julius': '07', 'augusztus': '08',
+    'szeptember': '09', 'oktober': '10', 'november': '11', 'december': '12',
+    # with accents
+    'január': '01', 'február': '02', 'március': '03', 'április': '04',
+    'május': '05', 'június': '06', 'július': '07', 'október': '10',
 }
 
 HEADERS = {
@@ -42,7 +48,7 @@ HEADERS = {
 }
 
 
-# -- State object -----------------------------------------------------
+# -- State object (no globals) ----------------------------------------
 class AppState:
     def __init__(self, year: str):
         self.year = year
@@ -58,47 +64,38 @@ def fetch_remote(url: str, accept: str = 'application/json') -> bytes:
         return resp.read()
 
 
-def detect_date_segment(year: str) -> str | None:
+def detect_date_segment() -> str | None:
     """
-    The valasztas.hu site is a React SPA — the 'Adatok frissitve' text is
-    rendered client-side and never appears in raw HTML fetched by urllib.
-
-    Instead, the date segment is embedded in the static asset URLs that the
-    server bakes into the HTML at build/deploy time, e.g.:
-        <script src="/ogy2026/static/js/main.03142100.chunk.js">
-    or in API endpoint references like:
-        /ogy2026/data/03142100/ver/EgyeniJeloltek.json
-
-    We look for an 8-digit segment in those patterns.
+    Scrape the 2026 results page and parse the last-update timestamp.
+    'Adatok frissitve: 2026. marcius 14. 21:00:00' -> '03142100'
     """
-    page = REFRESH_PAGES[year]
-    base = '/ogy2026' if year == '2026' else '/ogy2022'
-    print(f'[server] Detecting date segment from {page}')
-
+    print(f'[server] Detecting date from {REFRESH_PAGE}')
     try:
-        html = fetch_remote(page, accept='text/html').decode('utf-8', errors='replace')
+        html = fetch_remote(REFRESH_PAGE, accept='text/html').decode('utf-8', errors='replace')
     except Exception as e:
-        print(f'[server] WARNING: could not fetch page: {e}')
+        print(f'[server] WARNING: could not fetch refresh page: {e}')
         return None
 
-    # Primary: look for /data/DDDDDDDD/ anywhere in the raw HTML
-    m = re.search(r'/data/([0-9]{8})/', html)
-    if m:
-        seg = m.group(1)
-        print(f'[server] Date segment found via /data/ pattern: {seg}')
-        return seg
+    pattern = r'Adatok\s+friss[ií]tve\s*:\s*\d{4}\.\s*(\w+)\s+(\d{1,2})\.\s*(\d{2}):(\d{2}):\d{2}'
+    m = re.search(pattern, html, re.IGNORECASE)
+    if not m:
+        # looser fallback
+        m = re.search(r'\d{4}\.\s*(\w+)\s+(\d{1,2})\.\s*(\d{2}):(\d{2}):\d{2}', html)
+    if not m:
+        print('[server] WARNING: date pattern not found in page')
+        return None
 
-    # Fallback: 8-digit number inside a script/link src under the right base path
-    # e.g. /ogy2026/static/js/main.03142100.chunk.js
-    m = re.search(re.escape(base) + r'/[^"\']*?([0-9]{8})[^"\'/]*?\.(?:js|json)', html)
-    if m:
-        seg = m.group(1)
-        print(f'[server] Date segment found via script src pattern: {seg}')
-        return seg
+    month_hu, day, hour, minute = m.group(1), m.group(2), m.group(3), m.group(4)
+    # strip accents for lookup fallback
+    month_key = month_hu.lower()
+    month = HU_MONTHS.get(month_key)
+    if not month:
+        print(f'[server] WARNING: unknown month "{month_hu}"')
+        return None
 
-    print(f'[server] WARNING: no date segment found in HTML')
-    print(f'[server] First 800 chars of response:\n{html[:800]}')
-    return None
+    seg = f'{month}{int(day):02d}{hour}{minute}'
+    print(f'[server] Date detected: {seg}  (from "{m.group(0).strip()}")')
+    return seg
 
 
 def get_jeloltek_url(state: AppState) -> str:
@@ -137,7 +134,7 @@ def bust_candidates(state: AppState):
 def get_results(state: AppState) -> dict:
     url = get_eredmenyek_url(state)
     if not url:
-        raise ValueError('Eredmenyek URL ismeretlen -- toltse fel kezzel vagy varjon')
+        raise ValueError('Eredmenyek URL ismeretlen -- varjon az adatok frissitesere vagy toltse fel kezzel')
     print(f'[server] Fetching results: {url}')
     return json.loads(fetch_remote(url))
 
@@ -207,9 +204,11 @@ def make_handler(state: AppState):
                     self.send_json({'error': str(e)}, 502)
 
             elif path == '/api/refresh':
-                new_seg = detect_date_segment(state.year)
-                if new_seg:
-                    state.date_segment = new_seg
+                # Re-scrape date and bust candidates cache
+                if state.year == '2026':
+                    new_seg = detect_date_segment()
+                    if new_seg:
+                        state.date_segment = new_seg
                 bust_candidates(state)
                 try:
                     data = get_candidates(state)
@@ -238,11 +237,13 @@ def main():
 
     state = AppState(args.year)
 
-    state.date_segment = detect_date_segment(state.year)
-    if not state.date_segment:
-        fallback = '03142100' if state.year == '2026' else '04161400'
-        print(f'[server] WARNING: date detection failed -- using fallback {fallback}')
-        state.date_segment = fallback
+    if state.year == '2026':
+        state.date_segment = detect_date_segment()
+        if not state.date_segment:
+            print('[server] WARNING: date detection failed -- using fallback 03142100')
+            state.date_segment = '03142100'
+    else:
+        state.date_segment = '04161400'
 
     print()
     print('  Election Dashboard Server')
