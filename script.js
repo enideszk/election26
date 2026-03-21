@@ -177,7 +177,7 @@ let ejPartyMap = {};
 let candidatesLoaded = false;
 
 async function fetchJsonWithCorsproxy(link) {
-  const corsproxyPrefix = 'https://corsproxy.io/?key=cb711b4a&url=';
+  const corsproxyPrefix = 'http://localhost/?url=';
   const json = await fetch(`${corsproxyPrefix}${link}`).then(r => r.json());
   console.log(`Fetching JSON from ${link} returned:`);
   console.log(json);
